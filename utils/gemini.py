@@ -1,8 +1,8 @@
+# D:\telegram_reminder_bot\utils\gemini.py
 import re
 import asyncio
 from typing import List, Dict
 from google import genai
-from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL
 
 # Инициализируем клиент один раз
@@ -20,7 +20,7 @@ def _smart_trim(text: str, limit: int) -> str:
 
 def _history_to_prompt(history: List[Dict], model_name: str) -> str:
     """
-    Превращаем историю в один текст (совместимо с любыми версиями google-genai).
+    Склеиваем историю в одну строку — совместимо с любыми версиями google-genai.
     """
     lines = [
         f"[system] Ты — Gemini (Google), модель {model_name}. "
@@ -30,27 +30,26 @@ def _history_to_prompt(history: List[Dict], model_name: str) -> str:
     for m in history:
         role = "user" if m.get("role") == "user" else "assistant"
         content = (m.get("content") or "").strip()
-        lines.append(f"[{role}] {content}")
-    # Подсказываем, что сейчас должен говорить ассистент
+        if content:
+            lines.append(f"[{role}] {content}")
+    # подсказываем, что следующий ход — ассистента
     lines.append("[assistant]")
     return "\n".join(lines)
 
 def _call_sync(history: List[Dict], allow_long: bool, max_len: int, model_name: str) -> str:
     if not _client:
-        return "❗ GEMINI_API_KEY не задан (config_secrets.py / .env)."
+        return "❗ GEMINI_API_KEY не задан (config_secrets.py / переменные окружения)."
 
     model = model_name or GEMINI_MODEL or "gemini-2.5-flash"
     try:
         prompt = _history_to_prompt(history, model)
+        # Без types.*, без thinking_config — максимально совместимый вызов
         resp = _client.models.generate_content(
             model=model,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_budget=0)
-            ),
         )
         out = (getattr(resp, "text", "") or "").strip()
-        # На всякий случай убираем возможные префиксы
+        # На всякий случай срежем возможные префиксы
         out = re.sub(r"^(?:model|assistant)\s*:\s*", "", out, flags=re.I).strip()
         return out if allow_long else _smart_trim(out, max_len)
     except Exception as e:
