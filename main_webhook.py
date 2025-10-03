@@ -12,20 +12,16 @@ from handlers import commands, messages
 from handlers import notes as notes_handlers
 from utils.notes import notes_store
 
-# === Настройки вебхука ===
-# ОБЯЗАТЕЛЬНО добавь эти переменные в Render -> Environment:
-#   WEBHOOK_BASE   = https://<твой-сабдомен>.onrender.com
-#   WEBHOOK_SECRET = случайная строка (например, 32-64 символа)
-WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")
-WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")  # путь, где слушаем
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-DISABLE_BOT    = os.getenv("DISABLE_BOT", "0") == "1"   # быстрый “выключатель” бота без остановки сервиса
-PORT           = int(os.getenv("PORT", "10000"))        # Render проставляет PORT
+# === Настройки вебхука и окружения ===
+WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")  # например: https://notesbot.onrender.com
+WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")      # путь, по которому Telegram шлёт апдейты
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")            # можно оставить пустым
+DISABLE_BOT    = os.getenv("DISABLE_BOT", "0") == "1"       # быстрый "выключатель" бота
+PORT           = int(os.getenv("PORT", "10000"))            # Render проставляет PORT
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 
-# Полный URL, по которому Telegram будет слать обновления
 WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}" if WEBHOOK_BASE else None
 
 # === Телеграм напоминалки (фон) ===
@@ -65,23 +61,21 @@ async def handle_health(request: web.Request):
 
 # === Хуки старта/остановки ===
 async def on_startup(bot: Bot):
-    # Если включили “режим обслуживания” — не регистрируем вебхук
     if DISABLE_BOT:
         print("[startup] DISABLE_BOT=1 -> вебхук не устанавливаем, бот выключен")
         return
     if not WEBHOOK_URL:
         raise RuntimeError("WEBHOOK_BASE не задан. Укажи https://<service>.onrender.com в переменной WEBHOOK_BASE")
 
-    # Установка вебхука в Telegram
+    # Установка вебхука в Telegram (секрет пойдёт в заголовке X-Telegram-Bot-Api-Secret-Token)
     await bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
     print(f"[startup] Webhook set to {WEBHOOK_URL}")
 
 async def on_shutdown(bot: Bot):
-    # При завершении удаляем вебхук (чтобы не копились отложенные обновления)
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
         print("[shutdown] Webhook deleted")
@@ -102,22 +96,23 @@ async def create_app():
         web.get("/healthz", handle_health),
     ])
 
-    # Регистрируем обработчик вебхука
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    # секрет необязателен, но безопаснее с ним (совпадает с тем, что передали в set_webhook)
-    handler.register(app, path=WEBHOOK_PATH, secret_token=WEBHOOK_SECRET or None)
+    # ✅ ВАЖНО: secret_token передаём в КОНСТРУКТОР, а НЕ в register()
+    handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None,  # <-- тут
+    )
+    handler.register(app, path=WEBHOOK_PATH)  # <-- без secret_token
 
-    # Хуки старта/остановки DP и Bot в жизненный цикл aiohttp
+    # Встраиваем жизненный цикл dp/bot в aiohttp
     setup_application(app, dp, bot=bot)
 
-    # Наши кастомные хуки: поставить/убрать вебхук и фоновые задачи
+    # Наши хуки старта/остановки
     async def _startup(_app):
         await on_startup(bot)
-        # фоновая задача напоминаний (будет работать и в webhook-режиме)
         _app["reminder_task"] = asyncio.create_task(reminder_loop(bot))
 
     async def _cleanup(_app):
-        # аккуратно гасим фоновые задачи
         task = _app.get("reminder_task")
         if task:
             task.cancel()
@@ -131,7 +126,6 @@ async def create_app():
     return app
 
 def main():
-    # Запускаем aiohttp-сервер (Render ждёт, что процесс слушает PORT)
     app = asyncio.run(create_app())
     web.run_app(app, host="0.0.0.0", port=PORT)
 
