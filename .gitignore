@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+Режим вывода команд на экран (ECHO) включен.
+# Virtual env
+venv/
+Режим вывода команд на экран (ECHO) включен.
+# Local secrets
+.env
+config_secrets.py
+Режим вывода команд на экран (ECHO) включен.
+# Local DB / cache / logs
+db.sqlite3
+*.log
+Режим вывода команд на экран (ECHO) включен.
+# OS
+.DS_Store
+Thumbs.db
