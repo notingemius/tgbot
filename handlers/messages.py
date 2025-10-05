@@ -3,13 +3,14 @@ import re
 import asyncio
 from datetime import datetime
 from aiogram import Router, types, F
+
 from utils.memory import memory
 from utils.chat_settings import chat_settings
 from utils.notes import notes_store
 from utils import info as info_api
 from utils.gemini import ask_gemini
 
-# безопасный импорт Cerebras
+# Безопасный импорт Cerebras
 try:
     from utils.llm import ask_cerebras as _ask_cerebras
     async def ask_cerebras(*a, **kw):
@@ -20,28 +21,26 @@ except Exception:
 
 router = Router()
 
-# ---- триггеры инструментов ----
-WEATHER_RE = re.compile(r"(?:какая|какая сьогодні|какая сегодня|яка|яка сьогодні|погода|погодні|погоду|погоді|погоди).{0,10}?(?:в|у)?\s*(?P<city>[\w\-\sА-Яа-яЁёІіЇїЄєҐґ]+)?", re.I)
-HOLIDAY_RE = re.compile(r"(праздник|праздники|свято|свята)", re.I)
-SEARCH_RE  = re.compile(r"(найди|поищи|поисчи|пошукай|знайди|загугли|google|пошук|поиск)(.*)", re.I)
+# ====== Триггеры инструментов ======
+# Погода (терпимо к падежам/опечаткам)
+WEATHER_RE = re.compile(
+    r"(?:какая|какая сьогодні|какая сегодня|яка|яка сьогодні|погода|погодні|погоду|погоді|погоди)"
+    r".{0,12}?(?:в|у)?\s*(?P<city>[\w\-\sА-Яа-яЁёІіЇїЄєҐґ]+)?", re.I)
 
-# День недели/дата — отвечаем сами, а не через ИИ
+# Праздники
+HOLIDAY_RE = re.compile(r"(праздник|праздники|свято|свята)", re.I)
+
+# Веб-поиск
+SEARCH_RE  = re.compile(r"^(найди|поищи|поисчи|пошукай|знайди|загугли|google|пошук|поиск)\b[ :\-]*(?P<q>.+)$", re.I)
+
+# «Какой сегодня день»
 WHAT_DAY_RE = re.compile(r"(какой|який)\s+(сегодня|сьогодні)\s+(день|дата)", re.I)
 
-NOTE_TRIGGERS = r"(?:заметка|запомни|запиши|пометь|поміть|напомни|todo|to-?do|сделать|сделай)"
-
-def _extract_note(text: str) -> str | None:
-    # Если запрос — погода/поиск, не превращаем в заметку
-    if SEARCH_RE.search(text) or WEATHER_RE.search(text):
-        return None
-    m = re.search(rf"{NOTE_TRIGGERS}\b[:\- ]*(.+)$", text, flags=re.I | re.S)
-    if m:
-        return (m.group(1) or "").strip()
-    if re.search(rf"{NOTE_TRIGGERS}\b", text, flags=re.I):
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if len(lines) >= 2:
-            return lines[-1]
-    return None
+# ====== Заметки — ТОЛЬКО по явному префиксу в начале строки ======
+NOTE_PREFIX_RE = re.compile(
+    r"^(?:!note|!n|заметка|запиши|запомни|пометь|поміть|напомни)\b[ :\-]+(?P<text>.+)$",
+    re.I | re.S
+)
 
 def _day_string(lang: str) -> str:
     now = datetime.now()
@@ -59,7 +58,7 @@ async def any_text(message: types.Message):
     text = message.text or ""
     lang = chat_settings.get_lang(chat_id)
 
-    # A) День/дата
+    # A) День/дата — считаем локально
     if WHAT_DAY_RE.search(text):
         await message.answer(_day_string(lang))
         return
@@ -68,7 +67,8 @@ async def any_text(message: types.Message):
     wm = WEATHER_RE.search(text)
     if wm:
         raw_city = (wm.group("city") or "").strip()
-        city = re.sub(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", "", raw_city).strip()  # убрать дату из "Києві 05.10.2025"
+        # убрать дату из типа "Києві 05.10.2025"
+        city = re.sub(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", "", raw_city).strip()
         if not city:
             city = "Київ" if lang=="uk" else "Киев"
         try:
@@ -96,9 +96,7 @@ async def any_text(message: types.Message):
     # D) Веб-поиск
     sm = SEARCH_RE.search(text)
     if sm:
-        query = (sm.group(0) or text)
-        # отрежем вводное слово типа "найди/загугли"
-        query = re.sub(r"^(найди|поищи|поисчи|пошукай|знайди|загугли|google|пошук|поиск)\s+", "", query, flags=re.I)
+        query = (sm.group("q") or "").strip()
         try:
             ans = await info_api.web_search(query, lang, limit=3)
         except Exception as e:
@@ -106,14 +104,16 @@ async def any_text(message: types.Message):
         await message.answer(ans)
         return
 
-    # E) Заметка по триггеру
-    note_text = _extract_note(text)
-    if note_text:
-        note_id = notes_store.add(user_id=user_id, chat_id=chat_id, text=note_text)
-        await message.answer(f"📝 Заметка сохранена (#{note_id}):\n{note_text}")
-        return
+    # E) Заметка — ТОЛЬКО ЯВНЫЙ ПРЕФИКС
+    m = NOTE_PREFIX_RE.search(text)
+    if m:
+        note_text = (m.group("text") or "").strip()
+        if note_text:
+            note_id = notes_store.add(user_id=user_id, chat_id=chat_id, text=note_text)
+            await message.answer(f"📝 Заметка сохранена (#{note_id}):\n{note_text}")
+            return
 
-    # F) ИИ-диалог (с таймаутом)
+    # F) ИИ-диалог (с таймаутом, движок из настроек чата)
     engine = (chat_settings.get_ai(chat_id) or "gemini").strip().lower()
     memory.add(chat_id, "user", text)
     allow_long = bool(re.search(r'подроб|разверну|много', text, flags=re.I))
