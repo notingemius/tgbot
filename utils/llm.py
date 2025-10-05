@@ -1,65 +1,48 @@
-# D:\telegram_reminder_bot\utils\llm.py
+# utils/llm.py
 import re
-import aiohttp
-from typing import List, Optional, Dict
+import asyncio
+from typing import List, Dict
 from config import CEREBRAS_API_KEY, CEREBRAS_MODEL
 
-API_URL = "https://api.cerebras.ai/v1/chat/completions"
-SYSTEM_PROMPT = "Отвечай кратко. По умолчанию не более 500 символов, если явно не попросили подробно."
+__all__ = ["ask_cerebras"]
 
 def _smart_trim(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit]
-    for sep in [". ", "! ", "? ", "\n", " "]:
+    for sep in (". ", "! ", "? ", "\n", " "):
         p = cut.rfind(sep)
         if p >= int(limit * 0.6):
             return cut[:p+1].rstrip()
     return cut.rstrip() + "…"
 
-async def ask_ai(
-    prompt: Optional[str] = None,
-    *,
-    history: Optional[List[Dict]] = None,
-    allow_long: bool = False,
-    max_len: int = 500,
-    model: Optional[str] = None,
-    system_prompt: Optional[str] = None,
-) -> str:
+def _call_sync(history: List[Dict], allow_long: bool, max_len: int, model_name: str) -> str:
     if not CEREBRAS_API_KEY:
-        return "❗ Не задан CEREBRAS_API_KEY (config_secrets.py / .env)."
-
-    model = model or CEREBRAS_MODEL
-    system_prompt = system_prompt or SYSTEM_PROMPT
-
-    messages = [{"role": "system", "content": system_prompt}]
-    if history:
-        messages.extend(history)
-    elif prompt:
-        messages.append({"role": "user", "content": prompt})
-    else:
-        return "❗ Пустой запрос."
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": 2048 if allow_long else 512,
-        "temperature": 0.7,
-        "stream": False,
-    }
+        return "❗ CEREBRAS_API_KEY не задан."
+    try:
+        from cerebras.cloud.sdk import Cerebras  # требует пакет 'cerebras-cloud-sdk' в requirements.txt
+    except Exception:
+        return "⚠️ Cerebras SDK не установлен. Добавь 'cerebras-cloud-sdk' в requirements.txt или используй Gemini."
 
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(API_URL, headers={
-                "Authorization": f"Bearer {CEREBRAS_API_KEY}",
-                "Content-Type": "application/json",
-            }, json=payload, timeout=90) as resp:
-                if resp.status != 200:
-                    txt = await resp.text()
-                    return f"⚠️ API error {resp.status}: {txt[:400]}"
-                data = await resp.json()
+        client = Cerebras(api_key=CEREBRAS_API_KEY)
+        stream = client.chat.completions.create(
+            messages=history,
+            model=model_name or CEREBRAS_MODEL,
+            stream=True,
+            max_completion_tokens=2000,
+            temperature=0.7,
+            top_p=0.9,
+        )
+        out_parts = []
+        for chunk in stream:
+            out_parts.append(chunk.choices[0].delta.content or "")
+        out = "".join(out_parts).strip()
+        out = re.sub(r"^(?:model|assistant)\s*:\s*", "", out, flags=re.I).strip()
+        return out if allow_long else _smart_trim(out, max_len)
     except Exception as e:
-        return f"⚠️ Ошибка запроса к ИИ: {e}"
+        return f"⚠️ Cerebras error: {e}"
 
-    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-    return content.strip() if allow_long else _smart_trim(content.strip(), max_len)
+async def ask_cerebras(history: List[Dict], allow_long: bool, max_len: int = 600, model: str = "") -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _call_sync, history, allow_long, max_len, model or "")
