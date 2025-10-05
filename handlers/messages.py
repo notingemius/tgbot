@@ -1,13 +1,12 @@
-# D:\telegram_reminder_bot\handlers\messages.py
+# handlers/messages.py
 import re
 from aiogram import Router, types, F
-from utils.llm import ask_ai as ask_cerebras
-from utils.gemini import ask_gemini
 from utils.memory import memory
 from utils.chat_settings import chat_settings
 from utils.notes import notes_store
-from utils.note_runtime import get_pending, pop_pending
 from utils import info as info_api
+from utils.gemini import ask_gemini
+from utils.llm import ask_cerebras
 
 router = Router()
 
@@ -34,58 +33,51 @@ async def any_text(message: types.Message):
     text = message.text or ""
     lang = chat_settings.get_lang(chat_id)
 
-    # A) Ожидание кастомного интервала для заметок — обрабатывается выше (если используешь кастом-ввод)
-    pending_note_id = get_pending(chat_id, user_id)
-    if pending_note_id:
-        # это из предыдущей версии с кастомным snooze — оставляем как есть
-        await message.answer("Введи интервал формата: 2ч / 90м / 1.5ч")
-        return
-
-    # B) Быстрые инструменты в ИИ-режиме: погода / праздники
+    # B) Быстрые инструменты: погода / праздники
     wm = WEATHER_RE.search(text)
     if wm:
-        city = (wm.group("city") or "").strip()
-        if not city:
-            city = "Киев" if lang=="ru" else "Київ"
-        ans = await info_api.weather_today(city, lang)
+        city = (wm.group("city") or "").strip() or ("Київ" if lang=="uk" else "Киев")
+        try:
+            ans = await info_api.weather_today(city, lang)
+        except Exception as e:
+            ans = f"⚠️ Ошибка погоды: {e}"
         await message.answer(ans)
         return
 
     if HOLIDAY_RE.search(text):
         country = "UA" if lang=="uk" else "RU"
-        hs = await info_api.holidays_today(country)
+        try:
+            hs = await info_api.holidays_today(country)
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка праздников: {e}")
+            return
         if not hs:
             await message.answer("Сегодня официальных праздников нет." if lang=="ru" else "Сьогодні офіційних свят немає.")
         else:
-            if lang=="uk":
-                lines = [f"• {h['localName']} ({h.get('name','')})" for h in hs]
-                await message.answer("Свята сьогодні:\n" + "\n".join(lines))
-            else:
-                lines = [f"• {h['localName']} ({h.get('name','')})" for h in hs]
-                await message.answer("Праздники сегодня:\n" + "\n".join(lines))
+            lines = [f"• {h.get('localName') or h.get('name')}" for h in hs]
+            await message.answer(("Праздники сегодня:\n" if lang=="ru" else "Свята сьогодні:\n") + "\n".join(lines))
         return
 
-    # C) Распознавание заметки
+    # C) Заметка по триггеру
     note_text = _extract_note(text)
     if note_text:
         note_id = notes_store.add(user_id=user_id, chat_id=chat_id, text=note_text)
         await message.answer(f"📝 Заметка сохранена (#{note_id}):\n{note_text}")
         return
 
-    # D) Обычный ИИ-диалог
-    engine = (chat_settings.get_ai(chat_id) or "").strip().lower()
-    if engine not in ("gemini", "cerebras"):
-        await message.answer("Сначала выбери ИИ через /ai.")
-        return
-
+    # D) ИИ-диалог
+    engine = (chat_settings.get_ai(chat_id) or "gemini").strip().lower()
     memory.add(chat_id, "user", text)
     allow_long = bool(re.search(r'подроб|разверну|много', text, flags=re.I))
     history = memory.get(chat_id)
 
-    if engine == "gemini":
-        reply = await ask_gemini(history=history, allow_long=allow_long, max_len=500)
-    else:
-        reply = await ask_cerebras(history=history, allow_long=allow_long, max_len=500)
+    try:
+        if engine == "gemini":
+            reply = await ask_gemini(history=history, allow_long=allow_long, max_len=600)
+        else:
+            reply = await ask_cerebras(history=history, allow_long=allow_long, max_len=600)
+    except Exception as e:
+        reply = f"⚠️ Ошибка ИИ: {e}"
 
     memory.add(chat_id, "assistant", reply)
     await message.answer(reply)
