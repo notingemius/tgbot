@@ -4,8 +4,8 @@ from aiogram.filters import Command
 from utils.notes import notes_store
 from utils.chat_settings import chat_settings
 
-# простейший «режим добавления заметки» (в памяти процесса)
-_add_wait: set[tuple[int,int]] = set()   # {(chat_id, user_id)}
+# ждём «ввода новой заметки» только для этих (chat_id, user_id)
+_add_wait: set[tuple[int,int]] = set()
 
 router = Router()
 
@@ -53,12 +53,14 @@ async def cb_note_add(cq: types.CallbackQuery):
                             "Надішли текст нотатки одним рядком.")
     await cq.answer()
 
-@router.message(F.text & ~F.text.startswith("/"))
+# 🔧 ВАЖНО: фильтр срабатывает ТОЛЬКО когда ждём добавление (_add_wait)
+@router.message(
+    F.text & ~F.text.startswith("/") &
+    F.func(lambda m: (m.chat.id, m.from_user.id) in _add_wait)
+)
 async def catch_new_note(message: types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    if (chat_id, user_id) not in _add_wait:
-        return  # не ждём, пускаем дальше другим хэндлерам
     text = (message.text or "").strip()
     if not text:
         return
