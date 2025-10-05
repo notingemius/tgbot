@@ -1,4 +1,4 @@
-# D:\telegram_reminder_bot\utils\info.py
+# utils/info.py
 import aiohttp
 from datetime import datetime
 from typing import Optional
@@ -46,7 +46,6 @@ async def weather_today(city: str, lang: str = "ru") -> str:
         return f"Погода в {g['name']}: сейчас {t}°C, ветер {w} м/с, влажность {rh}%. Сегодня {tmin}…{tmax}°C, осадки {popmax}%."
 
 async def holidays_today(country: str) -> list[dict]:
-    # country: "UA", "RU", ...
     dt = datetime.utcnow().date()
     url = f"https://date.nager.at/api/v3/PublicHolidays/{dt.year}/{country}"
     async with aiohttp.ClientSession() as s:
