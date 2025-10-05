@@ -6,7 +6,15 @@ from utils.chat_settings import chat_settings
 from utils.notes import notes_store
 from utils import info as info_api
 from utils.gemini import ask_gemini
-from utils.llm import ask_cerebras
+
+# безопасный импорт Cerebras: если не получится — используем заглушку, чтобы бот не падал
+try:
+    from utils.llm import ask_cerebras as _ask_cerebras
+    async def ask_cerebras(*a, **kw):
+        return await _ask_cerebras(*a, **kw)
+except Exception:
+    async def ask_cerebras(*a, **kw):
+        return "❗ Cerebras недоступен на сервере. Используй Gemini или установи 'cerebras-cloud-sdk'."
 
 router = Router()
 
@@ -33,7 +41,7 @@ async def any_text(message: types.Message):
     text = message.text or ""
     lang = chat_settings.get_lang(chat_id)
 
-    # B) Быстрые инструменты: погода / праздники
+    # Быстрые инструменты
     wm = WEATHER_RE.search(text)
     if wm:
         city = (wm.group("city") or "").strip() or ("Київ" if lang=="uk" else "Киев")
@@ -58,14 +66,14 @@ async def any_text(message: types.Message):
             await message.answer(("Праздники сегодня:\n" if lang=="ru" else "Свята сьогодні:\n") + "\n".join(lines))
         return
 
-    # C) Заметка по триггеру
+    # Заметки по триггеру
     note_text = _extract_note(text)
     if note_text:
         note_id = notes_store.add(user_id=user_id, chat_id=chat_id, text=note_text)
         await message.answer(f"📝 Заметка сохранена (#{note_id}):\n{note_text}")
         return
 
-    # D) ИИ-диалог
+    # ИИ-диалог
     engine = (chat_settings.get_ai(chat_id) or "gemini").strip().lower()
     memory.add(chat_id, "user", text)
     allow_long = bool(re.search(r'подроб|разверну|много', text, flags=re.I))
