@@ -10,14 +10,15 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from config import TELEGRAM_TOKEN
 from handlers import commands, messages
 from handlers import notes as notes_handlers
+from handlers import daily as daily_handlers
 from utils.notes import notes_store
 
-WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")  # https://<your>.onrender.com
+WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-CRON_SECRET    = os.getenv("CRON_SECRET", "")               # секрет для /cron/tick
+CRON_SECRET    = os.getenv("CRON_SECRET", "")
 DISABLE_BOT    = os.getenv("DISABLE_BOT", "0") == "1"
-DISABLE_LOOP   = os.getenv("DISABLE_LOOP", "1") == "1"      # по умолчанию отключаем фон.цикл на free
+DISABLE_LOOP   = os.getenv("DISABLE_LOOP", "1") == "1"
 PORT           = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_TOKEN:
@@ -42,7 +43,6 @@ async def handle_health(request: web.Request):
     return web.Response(text="OK")
 
 async def handle_cron_tick(request: web.Request):
-    # защита по секрету
     if CRON_SECRET:
         if request.query.get("key") != CRON_SECRET:
             return web.Response(status=403, text="forbidden")
@@ -50,7 +50,7 @@ async def handle_cron_tick(request: web.Request):
     due = notes_store.list_due(limit=500)
     sent = 0
     for it in due:
-        notes_store.keep_open(it["id"])  # возвращаем в open, чтобы не дублировалось
+        notes_store.keep_open(it["id"])
         try:
             await bot.send_message(
                 it["chat_id"],
@@ -101,6 +101,7 @@ async def create_app():
 
     dp.include_router(commands.router)
     dp.include_router(notes_handlers.router)
+    dp.include_router(daily_handlers.router)   # <-- новый роутер
     dp.include_router(messages.router)
 
     app = web.Application()
@@ -108,7 +109,7 @@ async def create_app():
     app.add_routes([
         web.get("/", handle_root),
         web.get("/healthz", handle_health),
-        web.get("/cron/tick", handle_cron_tick),  # внешний пинг вызывает напоминания
+        web.get("/cron/tick", handle_cron_tick),
     ])
 
     handler = SimpleRequestHandler(
@@ -125,7 +126,7 @@ async def create_app():
             _app["reminder_task"] = asyncio.create_task(reminder_loop(bot))
             print("[startup] reminder loop started")
         else:
-            print("[startup] reminder loop DISABLED (use /cron/tick from external pinger)")
+            print("[startup] reminder loop DISABLED (use /cron/tick)")
 
     async def _cleanup(_app):
         task = _app.get("reminder_task")
