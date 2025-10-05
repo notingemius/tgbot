@@ -7,20 +7,20 @@ from aiogram.types import (
 )
 from utils.chat_settings import chat_settings
 from utils.notes import notes_store
+from config import GEMINI_API_KEY, CEREBRAS_API_KEY
 
 router = Router()
 
 LANG_LABELS = {
-    "choose": {"ru": "Выберите язык", "uk": "Оберіть мову"},
     "menu_title": {"ru": "Главное меню", "uk": "Головне меню"},
     "menu_ai": {"ru": "🤖 ИИ", "uk": "🤖 ШІ"},
     "menu_notes": {"ru": "📝 Заметки", "uk": "📝 Нотатки"},
     "menu_daily": {"ru": "📅 Ежедневные", "uk": "📅 Щоденні"},
+    "menu_lang": {"ru": "🌐 Язык", "uk": "🌐 Мова"},
     "pick_ai": {"ru": "Выбери движок ИИ:", "uk": "Обери двигун ШІ:"},
     "engine_set": {"ru": "✅ Движок установлен: ", "uk": "✅ Двигун встановлено: "},
     "ctx_cleared": {"ru": "ℹ️ Контекст очищен. Можешь писать сообщения.", "uk": "ℹ️ Контекст очищено. Можеш писати повідомлення."},
     "no_notes": {"ru": "Список заметок пуст. Пришли текст — добавлю.", "uk": "Список нотаток порожній. Надішли текст — додам."},
-    "no_daily": {"ru": "Список ежедневных пуст. Отправь текст — добавлю.", "uk": "Список щоденних порожній. Надішли текст — додам."},
 }
 def t(lang: str, key: str) -> str:
     return LANG_LABELS.get(key, {}).get(lang, LANG_LABELS.get(key, {}).get("ru", key))
@@ -30,6 +30,7 @@ def main_menu_kbd(lang: str) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=t(lang, "menu_ai"))],
             [KeyboardButton(text=t(lang, "menu_notes")), KeyboardButton(text=t(lang, "menu_daily"))],
+            [KeyboardButton(text=t(lang, "menu_lang"))],
         ],
         resize_keyboard=True, is_persistent=True
     )
@@ -49,15 +50,12 @@ def ai_picker_kbd() -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     chat_id = message.chat.id
-    lang = chat_settings.get_lang(chat_id)
-    # если язык ещё не установлен — попросим выбрать
-    if lang not in ("ru", "uk"):
-        await message.answer("Оберіть мову / Выберите язык", reply_markup=lang_kbd())
-        return
-
+    # ПРИ ЛЮБОМ /start — показываем меню и ПОД ним клавиатуру выбора языка (как ты хотел)
+    lang = chat_settings.get_lang(chat_id)  # вернёт 'ru' по умолчанию
     await message.answer(f"{t(lang,'menu_title')} ✅", reply_markup=main_menu_kbd(lang))
+    await message.answer("Оберіть мову / Выберите язык", reply_markup=lang_kbd())
 
-    # при заходе — показать открытые заметки (если есть)
+    # показать ожидающие заметки
     user_id = message.from_user.id
     items = notes_store.list_pending(user_id, chat_id, limit=20)
     if items:
@@ -91,8 +89,8 @@ async def on_ai_pick(cq: types.CallbackQuery):
     await cq.message.edit_text(t(lang, "engine_set") + ai + f"\n{t(lang,'ctx_cleared')}")
     await cq.answer()
 
-# Обрабатываем только ТЕКСТЫ меню, чтобы не перехватывать все сообщения
-MENU_TEXTS = {"🤖 ИИ","📝 Заметки","📅 Ежедневные","🤖 ШІ","📝 Нотатки","📅 Щоденні"}
+# Меню — обрабатываем только тексты из него
+MENU_TEXTS = {"🤖 ИИ","📝 Заметки","📅 Ежедневные","🤖 ШІ","📝 Нотатки","📅 Щоденні","🌐 Язык","🌐 Мова"}
 
 @router.message(F.text.in_(MENU_TEXTS))
 async def menu_router(message: types.Message):
@@ -114,3 +112,39 @@ async def menu_router(message: types.Message):
         from .daily import show_daily_list
         await show_daily_list(message)
         return
+
+    if text in {"🌐 Язык","🌐 Мова"}:
+        await message.answer("Оберіть мову / Выберите язык", reply_markup=lang_kbd())
+        return
+
+# /debug — статус в чат
+@router.message(Command("debug"))
+async def cmd_debug(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    lang = chat_settings.get_lang(chat_id)
+    ai = chat_settings.get_ai(chat_id) or "gemini"
+
+    # считаем «ожидания ввода»
+    from handlers.notes import _add_wait as notes_wait
+    from handlers.daily import _add_wait as daily_wait
+
+    notes_open = len(notes_store.list_open_all(user_id, chat_id, 999))
+    try:
+        from utils.daily import daily_store
+        daily_count = len(daily_store.list(user_id, chat_id))
+    except Exception:
+        daily_count = -1
+
+    text = (
+        f"🧪 DEBUG\n"
+        f"- lang: {lang}\n"
+        f"- ai: {ai}\n"
+        f"- GEMINI_API_KEY: {'set' if GEMINI_API_KEY else 'missing'}\n"
+        f"- CEREBRAS_API_KEY: {'set' if CEREBRAS_API_KEY else 'missing'}\n"
+        f"- notes open: {notes_open}\n"
+        f"- daily count: {daily_count}\n"
+        f"- waiting note text: {('yes' if (chat_id, user_id) in notes_wait else 'no')}\n"
+        f"- waiting daily text: {('yes' if (chat_id, user_id) in daily_wait else 'no')}\n"
+    )
+    await message.answer(text)
