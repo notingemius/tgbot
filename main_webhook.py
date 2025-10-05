@@ -18,7 +18,7 @@ WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 CRON_SECRET    = os.getenv("CRON_SECRET", "")
 DISABLE_BOT    = os.getenv("DISABLE_BOT", "0") == "1"
-DISABLE_LOOP   = os.getenv("DISABLE_LOOP", "1") == "1"
+DISABLE_LOOP   = os.getenv("DISABLE_LOOP", "1") == "1"  # по умолчанию используем /cron/tick на free
 PORT           = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_TOKEN:
@@ -33,9 +33,10 @@ def note_kbd(note_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✅ Да (выполнено)", callback_data=f"note:done:{note_id}"),
             InlineKeyboardButton(text="❌ Нет",            callback_data=f"note:keep:{note_id}"),
         ],
-        [   InlineKeyboardButton(text="⏰ Отложить 2ч",    callback_data=f"note:snooze:{note_id}:120") ],
+        [InlineKeyboardButton(text="⏰ Отложить 2ч", callback_data=f"note:snooze:{note_id}:120")],
     ])
 
+# ---------- HTTP handlers ----------
 async def handle_root(request: web.Request):
     return web.Response(text="NotesBot webhook is running")
 
@@ -43,9 +44,8 @@ async def handle_health(request: web.Request):
     return web.Response(text="OK")
 
 async def handle_cron_tick(request: web.Request):
-    if CRON_SECRET:
-        if request.query.get("key") != CRON_SECRET:
-            return web.Response(status=403, text="forbidden")
+    if CRON_SECRET and request.query.get("key") != CRON_SECRET:
+        return web.Response(status=403, text="forbidden")
     bot: Bot = request.app["bot"]
     due = notes_store.list_due(limit=500)
     sent = 0
@@ -62,6 +62,19 @@ async def handle_cron_tick(request: web.Request):
             pass
     return web.Response(text=f"ok: sent={sent}")
 
+async def handle_tginfo(request: web.Request):
+    """Диагностика: кто я, какой вебхук стоит у Telegram, и были ли ошибки доставки."""
+    bot: Bot = request.app["bot"]
+    me = await bot.get_me()
+    info = await bot.get_webhook_info()
+    # pydantic v2 -> model_dump()
+    payload = {
+        "me": {"id": me.id, "username": me.username, "name": me.first_name},
+        "webhook": info.model_dump(),
+    }
+    return web.json_response(payload)
+
+# ---------- reminder loop (опц.) ----------
 async def reminder_loop(bot: Bot):
     while True:
         try:
@@ -77,7 +90,10 @@ async def reminder_loop(bot: Bot):
             pass
         await asyncio.sleep(60)
 
+# ---------- startup / shutdown ----------
 async def on_startup(bot: Bot):
+    me = await bot.get_me()
+    print(f"[startup] bot: @{me.username} (id={me.id})")
     if DISABLE_BOT:
         print("[startup] DISABLE_BOT=1 -> webhook не ставим")
         return
@@ -95,13 +111,14 @@ async def on_shutdown(bot: Bot):
         await bot.delete_webhook(drop_pending_updates=True)
         print("[shutdown] webhook deleted")
 
+# ---------- app factory ----------
 async def create_app():
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher()
 
     dp.include_router(commands.router)
     dp.include_router(notes_handlers.router)
-    dp.include_router(daily_handlers.router)   # <-- новый роутер
+    dp.include_router(daily_handlers.router)
     dp.include_router(messages.router)
 
     app = web.Application()
@@ -110,6 +127,7 @@ async def create_app():
         web.get("/", handle_root),
         web.get("/healthz", handle_health),
         web.get("/cron/tick", handle_cron_tick),
+        web.get("/tginfo", handle_tginfo),  # <-- новая диагностика
     ])
 
     handler = SimpleRequestHandler(
