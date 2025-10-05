@@ -50,12 +50,14 @@ async def cb_daily_add(cq: types.CallbackQuery):
                             "Надішли текст щоденної активності одним рядком.")
     await cq.answer()
 
-@router.message(F.text & ~F.text.startswith("/"))
+# 🔧 ВАЖНО: фильтр срабатывает ТОЛЬКО когда ждём добавление (_add_wait)
+@router.message(
+    F.text & ~F.text.startswith("/") &
+    F.func(lambda m: (m.chat.id, m.from_user.id) in _add_wait)
+)
 async def catch_daily_add(message: types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    if (chat_id, user_id) not in _add_wait:
-        return
     text = (message.text or "").strip()
     if not text:
         return
