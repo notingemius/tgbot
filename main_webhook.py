@@ -34,7 +34,20 @@ log = logging.getLogger("app")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 
-WEBHOOK_URL = f"{WEBHOOK_BASE.rstrip('/')}{WEBHOOK_PATH}" if WEBHOOK_BASE else None
+# fallback на переменную от Render
+RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+def _pick_base_from_request(req: web.Request) -> str:
+    # Пробуем заголовки прокси (Render)
+    proto = req.headers.get("X-Forwarded-Proto") or req.scheme or "https"
+    host  = req.headers.get("X-Forwarded-Host") or req.host
+    if host:
+        return f"{proto}://{host}"
+    # последний шанс — SERVER_NAME
+    return f"{proto}://{req.host}"
+
+def _compose_url(base: str) -> str:
+    return f"{base.rstrip('/')}{WEBHOOK_PATH}"
 
 # =================== КНОПКИ ДЛЯ НОТИФАЕРА ===================
 def note_kbd(note_id: int) -> InlineKeyboardMarkup:
@@ -49,7 +62,17 @@ def note_kbd(note_id: int) -> InlineKeyboardMarkup:
 # =================== AIOHTTP MIDDLEWARE ===================
 @web.middleware
 async def access_logger(request: web.Request, handler):
-    is_webhook = (request.path == WEBHOOK_PATH and request.method == "POST")
+    # Автоустановка вебхука "по пути"
+    app = request.app
+    is_webhook = (request.path == app["WEBHOOK_PATH"] and request.method == "POST")
+
+    # если вебхук ещё не установлен и не запрещено — попробуем установить,
+    # используя базу из запроса (scheme+host)
+    if (not app["webhook_installed"]) and (not app["disable_bot"]) and request.method in ("GET", "HEAD"):
+        base = app.get("webhook_base") or _pick_base_from_request(request)
+        ok = await _ensure_webhook(app, base, drop=False)
+        log.info("[auto-install] tried=%s ok=%s base=%s", True, ok, base)
+
     if is_webhook:
         secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         xff = request.headers.get("X-Forwarded-For")
@@ -94,6 +117,27 @@ def install_error_logging(dp: Dispatcher):
             upd = "<cannot dump update>"
         log.exception("[aiogram] unhandled error. update=%s", upd, exc_info=event.exception)
 
+# =================== УСТАНОВКА ВЕБХУКА ===================
+async def _ensure_webhook(app: web.Application, base: str, drop: bool) -> bool:
+    """Ставит вебхук, если base задан и вебхук ещё не установлен. Возвращает True при успехе."""
+    if not base:
+        return False
+    bot: Bot = app["bot"]
+    url = _compose_url(base)
+    try:
+        await bot.set_webhook(url=url, secret_token=app["webhook_secret"] or None, drop_pending_updates=drop)
+        info = await bot.get_webhook_info()
+        if info.url == url:
+            app["webhook_installed"] = True
+            app["webhook_base"] = base
+            log.info("[webhook] installed url=%s", url)
+            return True
+        log.warning("[webhook] set_webhook did not stick. info.url=%s expected=%s", info.url, url)
+        return False
+    except Exception as e:
+        log.exception("[webhook] set_webhook failed: %s", e)
+        return False
+
 # =================== HTTP ХЭНДЛЕРЫ ===================
 async def handle_root(_: web.Request):
     return web.Response(text="NotesBot webhook is running")
@@ -108,20 +152,31 @@ async def handle_tginfo(request: web.Request):
     return web.json_response({
         "me": {"id": me.id, "username": me.username, "name": me.first_name},
         "webhook": info.model_dump(),
-        "expect_secret": bool(WEBHOOK_SECRET),
-        "webhook_path": WEBHOOK_PATH,
+        "expect_secret": bool(request.app["webhook_secret"]),
+        "webhook_path": request.app["WEBHOOK_PATH"],
+        "stored_base": request.app.get("webhook_base"),
+        "installed": request.app["webhook_installed"],
+        "render_external_url": RENDER_EXTERNAL_URL,
     })
 
 async def handle_debug_config(_: web.Request):
-    # Показываем только факт наличия ключей, без значений
     return web.json_response({
         "has_telegram_token": bool(TELEGRAM_TOKEN),
         "has_gemini_key": bool(GEMINI_API_KEY),
         "has_cerebras_key": bool(CEREBRAS_API_KEY),
-        "webhook_base": WEBHOOK_BASE,
+        "webhook_base_env": WEBHOOK_BASE,
+        "render_external_url": RENDER_EXTERNAL_URL,
         "webhook_path": WEBHOOK_PATH,
         "expect_secret": bool(WEBHOOK_SECRET),
     })
+
+async def handle_install(request: web.Request):
+    if request.app["disable_bot"]:
+        return web.json_response({"ok": False, "reason": "DISABLE_BOT=1"}, status=400)
+    # Пытаемся по приоритету: WEBHOOK_BASE -> RENDER_EXTERNAL_URL -> из запроса
+    base = WEBHOOK_BASE or RENDER_EXTERNAL_URL or _pick_base_from_request(request)
+    ok = await _ensure_webhook(request.app, base, drop=True)
+    return web.json_response({"ok": ok, "base": base, "url": _compose_url(base)})
 
 async def handle_test_send(request: web.Request):
     if CRON_SECRET and request.query.get("key") != CRON_SECRET:
@@ -176,26 +231,28 @@ async def reminder_loop(bot: Bot):
         await asyncio.sleep(60)
 
 # =================== STARTUP / SHUTDOWN ===================
-async def on_startup(bot: Bot):
+async def on_startup(app: web.Application):
+    bot: Bot = app["bot"]
     me = await bot.get_me()
     log.info("[startup] bot: @%s id=%s", me.username, me.id)
-    log.info("[startup] WEBHOOK_BASE=%s PATH=%s SECRET_SET=%s", WEBHOOK_BASE, WEBHOOK_PATH, bool(WEBHOOK_SECRET))
-    if DISABLE_BOT:
+    log.info("[startup] BASE(env)=%s RENDER_EXTERNAL_URL=%s PATH=%s SECRET_SET=%s",
+             WEBHOOK_BASE, RENDER_EXTERNAL_URL, app["WEBHOOK_PATH"], bool(app["webhook_secret"]))
+
+    if app["disable_bot"]:
         log.warning("[startup] DISABLE_BOT=1 -> webhook NOT set")
         return
-    if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_BASE is not set (e.g., https://<service>.onrender.com)")
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=True,
-    )
-    log.info("[startup] webhook set to %s", WEBHOOK_URL)
-    info = await bot.get_webhook_info()
-    log.info("[startup] webhook info: url=%s last_error=%s %s",
-             info.url, info.last_error_date, info.last_error_message)
 
-async def on_shutdown(bot: Bot):
+    # при старте пробуем WEBHOOK_BASE или RENDER_EXTERNAL_URL
+    base = WEBHOOK_BASE or RENDER_EXTERNAL_URL
+    if base:
+        ok = await _ensure_webhook(app, base, drop=True)
+        if not ok:
+            log.warning("[startup] failed to install webhook from env, will retry lazily on first request")
+    else:
+        log.warning("[startup] no base URL yet; will try to auto-install on first external HTTP request")
+
+async def on_shutdown(app: web.Application):
+    bot: Bot = app["bot"]
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("[shutdown] webhook deleted")
@@ -218,11 +275,19 @@ async def create_app():
 
     app = web.Application(middlewares=[access_logger])
     app["bot"] = bot
+    app["WEBHOOK_PATH"]   = WEBHOOK_PATH
+    app["webhook_secret"] = WEBHOOK_SECRET or ""
+    app["disable_bot"]    = bool(DISABLE_BOT)
+    app["webhook_installed"] = False
+    # предварительная база — если есть
+    app["webhook_base"] = (WEBHOOK_BASE or RENDER_EXTERNAL_URL or "").rstrip("/")
+
     app.add_routes([
         web.get("/", handle_root),
         web.get("/healthz", handle_health),
         web.get("/tginfo", handle_tginfo),
         web.get("/debug/config", handle_debug_config),
+        web.get("/install", handle_install),   # ручная установка вебхука
         web.get("/test/send", handle_test_send),
         web.get("/cron/tick", handle_cron_tick),
     ])
@@ -230,13 +295,13 @@ async def create_app():
     handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-        secret_token=WEBHOOK_SECRET or None,  # если задан — запросы без секрета отвергнутся
+        secret_token=(WEBHOOK_SECRET or None),  # если задан — запросы без секрета отвергнутся
     )
     handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
 
     async def _startup(_app):
-        await on_startup(bot)
+        await on_startup(_app)
         if not DISABLE_LOOP:
             _app["reminder_task"] = asyncio.create_task(reminder_loop(bot))
             log.info("[startup] reminder loop started")
@@ -249,7 +314,7 @@ async def create_app():
             task.cancel()
             with contextlib.suppress(Exception):
                 await task
-        await on_shutdown(bot)
+        await on_shutdown(_app)
 
     app.on_startup.append(_startup)
     app.on_cleanup.append(_cleanup)
