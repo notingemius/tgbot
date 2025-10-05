@@ -1,4 +1,4 @@
-# D:\telegram_reminder_bot\main_webhook.py
+# main_webhook.py
 import os
 import asyncio
 import contextlib
@@ -7,25 +7,21 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-from config import TELEGRAM_TOKEN
+from config import (
+    TELEGRAM_TOKEN, WEBHOOK_BASE, WEBHOOK_PATH, WEBHOOK_SECRET, CRON_SECRET,
+    DISABLE_BOT, DISABLE_LOOP, PORT
+)
 from handlers import commands, messages
 from handlers import notes as notes_handlers
 from handlers import daily as daily_handlers
 from utils.notes import notes_store
-
-WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "").rstrip("/")
-WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-CRON_SECRET    = os.getenv("CRON_SECRET", "")
-DISABLE_BOT    = os.getenv("DISABLE_BOT", "0") == "1"
-DISABLE_LOOP   = os.getenv("DISABLE_LOOP", "1") == "1"  # по умолчанию используем /cron/tick на free
-PORT           = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 
 WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}" if WEBHOOK_BASE else None
 
+# --------- вспомогательные кнопки -----------
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 def note_kbd(note_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -36,7 +32,7 @@ def note_kbd(note_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏰ Отложить 2ч", callback_data=f"note:snooze:{note_id}:120")],
     ])
 
-# ---------- HTTP handlers ----------
+# --------------- HTTP handlers ---------------
 async def handle_root(request: web.Request):
     return web.Response(text="NotesBot webhook is running")
 
@@ -63,18 +59,15 @@ async def handle_cron_tick(request: web.Request):
     return web.Response(text=f"ok: sent={sent}")
 
 async def handle_tginfo(request: web.Request):
-    """Диагностика: кто я, какой вебхук стоит у Telegram, и были ли ошибки доставки."""
     bot: Bot = request.app["bot"]
     me = await bot.get_me()
     info = await bot.get_webhook_info()
-    # pydantic v2 -> model_dump()
-    payload = {
+    return web.json_response({
         "me": {"id": me.id, "username": me.username, "name": me.first_name},
         "webhook": info.model_dump(),
-    }
-    return web.json_response(payload)
+    })
 
-# ---------- reminder loop (опц.) ----------
+# --------------- reminder loop (опционально) ---------------
 async def reminder_loop(bot: Bot):
     while True:
         try:
@@ -90,15 +83,15 @@ async def reminder_loop(bot: Bot):
             pass
         await asyncio.sleep(60)
 
-# ---------- startup / shutdown ----------
+# --------------- startup / shutdown ---------------
 async def on_startup(bot: Bot):
     me = await bot.get_me()
     print(f"[startup] bot: @{me.username} (id={me.id})")
     if DISABLE_BOT:
-        print("[startup] DISABLE_BOT=1 -> webhook не ставим")
+        print("[startup] DISABLE_BOT=1 -> webhook not set")
         return
     if not WEBHOOK_URL:
-        raise RuntimeError("WEBHOOK_BASE не задан (пример: https://<service>.onrender.com)")
+        raise RuntimeError("WEBHOOK_BASE is not set, e.g. https://<service>.onrender.com")
     await bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET or None,
@@ -111,11 +104,12 @@ async def on_shutdown(bot: Bot):
         await bot.delete_webhook(drop_pending_updates=True)
         print("[shutdown] webhook deleted")
 
-# ---------- app factory ----------
+# --------------- app factory ---------------
 async def create_app():
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher()
 
+    # порядок важен: сначала узкие роутеры, затем общий messages
     dp.include_router(commands.router)
     dp.include_router(notes_handlers.router)
     dp.include_router(daily_handlers.router)
@@ -127,7 +121,7 @@ async def create_app():
         web.get("/", handle_root),
         web.get("/healthz", handle_health),
         web.get("/cron/tick", handle_cron_tick),
-        web.get("/tginfo", handle_tginfo),  # <-- новая диагностика
+        web.get("/tginfo", handle_tginfo),
     ])
 
     handler = SimpleRequestHandler(
